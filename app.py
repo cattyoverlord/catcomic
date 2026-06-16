@@ -46,6 +46,12 @@ def get_db():
         what TEXT, owner TEXT, status TEXT DEFAULT 'unknown',
         source_quote TEXT, created_at TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS kickoffs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_name TEXT, description TEXT,
+        scope_json TEXT, stakeholders_json TEXT,
+        checklist_json TEXT, created_at TEXT
+    )""")
     conn.commit()
     return conn
 
@@ -301,16 +307,176 @@ Return JSON:
     end = text.rfind('}') + 1
     return json.loads(text[start:end])
 
+def run_kickoff(project_name, description, scope):
+    client = get_client()
+
+    scope_text = "\n".join([f"- {k}: {'Yes' if v else 'No'}" for k, v in scope.items()])
+
+    prompt = f"""You are a project intelligence agent helping a ZaloPay project owner start a new project correctly.
+
+Project name: {project_name}
+Description: {description}
+
+Project scope (answered by the project owner):
+{scope_text}
+
+ZaloPay context: Teams that may be involved in any project include:
+- Tech FE: front-end app changes, user-facing UI
+- Tech BE: backend APIs, services, deployments
+- Risk: fraud detection, risk scoring, user risk checks, key management
+- CS (Customer Support): training materials, FAQs, support procedures, complaint handling
+- Operations/Biz: business processes, merchant contracts, partner alignment, quy trình
+- Legal: contract review, FAQs legal review, compliance
+- Data Platform: dashboards, event tracking, data pipelines, reporting
+- Reconciliation/Accounting (AC): fund flow, đối soát, settlement, payment reconciliation
+- External Partners: banks (CIMB, NAPAS), merchants, third-party integrations
+- UM (User Management): user profiles, KYC, eKYC
+- Product (PO): PRD, user journey, sequence diagrams, technical doc sign-off
+
+Based on the scope, return a JSON with:
+1. required_stakeholders: list of teams that MUST be involved, each with:
+   - team: team name
+   - role: what they need to do in this project
+   - why: specific reason based on the scope answers
+2. open_questions: list of critical questions that must be answered before build starts (based on scope)
+3. assumptions_to_validate: list of things the team is likely assuming that need verification
+4. checklist_items: key launch readiness items for this project scope (draw from ZaloPay product launch patterns: fund flow check, load test, CS training, golive announcement, reconciliation flow, etc.)
+5. risk_areas: what could go wrong if the wrong people are excluded
+
+Return ONLY valid JSON:
+{{
+  "required_stakeholders": [{{"team": "", "role": "", "why": ""}}],
+  "open_questions": [""],
+  "assumptions_to_validate": [""],
+  "checklist_items": [{{"area": "", "item": ""}}],
+  "risk_areas": [""]
+}}"""
+
+    response = client.chat.completions.create(
+        model="deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    text = response.choices[0].message.content.strip()
+    start = text.find('{')
+    end = text.rfind('}') + 1
+    return json.loads(text[start:end])
+
+
 # ── UI ────────────────────────────────────────────────────────────────
 conn = get_db()
 
 st.title("🧠 Project Intelligence Agent")
 st.caption("Tracks decisions, assumptions, open questions, and tensions across conversations.")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📥 Analyze Conversation", "📋 Project State", "🔁 Restatement Check", "⏰ Escalation Simulator"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🚀 Project Kickoff", "📥 Analyze Conversation", "📋 Project State", "🔁 Restatement Check", "⏰ Escalation Simulator"])
 
-# ── TAB 1: ANALYZE ────────────────────────────────────────────────────
+# ── TAB 1: KICKOFF ────────────────────────────────────────────────────
 with tab1:
+    st.subheader("Project Kickoff")
+    st.caption("Answer a few questions about your project. The agent will map who needs to be involved and what to resolve before build starts.")
+
+    with st.form("kickoff_form"):
+        project_name = st.text_input("Project name", placeholder="e.g. PayLater QR Global Rollout")
+        description = st.text_area("What is this project doing?", height=100,
+            placeholder="Describe the feature, change, or initiative in 1-3 sentences.")
+
+        st.markdown("**Scope questions**")
+        col1, col2 = st.columns(2)
+        with col1:
+            fund_flow = st.checkbox("Involves changes to payment processing or fund flow")
+            external_partner = st.checkbox("Involves a new external partner, bank, or merchant")
+            kyc = st.checkbox("Involves user data, KYC, or eKYC")
+            ui_changes = st.checkbox("Involves user-facing UI or app changes")
+        with col2:
+            reconciliation = st.checkbox("Affects reconciliation or settlement (đối soát)")
+            risk = st.checkbox("Involves risk scoring or fraud detection")
+            cs_impact = st.checkbox("Requires CS training or new support procedures")
+            new_apis = st.checkbox("Requires new APIs or third-party integrations")
+
+        submitted = st.form_submit_button("🔍 Map this project", type="primary")
+
+    if submitted and project_name and description:
+        scope = {
+            "Payment processing / fund flow": fund_flow,
+            "New external partner / bank / merchant": external_partner,
+            "User data / KYC / eKYC": kyc,
+            "User-facing UI changes": ui_changes,
+            "Reconciliation / settlement": reconciliation,
+            "Risk scoring / fraud detection": risk,
+            "CS training / support procedures": cs_impact,
+            "New APIs / third-party integrations": new_apis,
+        }
+
+        with st.spinner("Mapping stakeholders and checklist..."):
+            try:
+                result = run_kickoff(project_name, description, scope)
+            except Exception as e:
+                st.error(f"Error: {e}")
+                st.stop()
+
+        st.success(f"Kickoff map for: **{project_name}**")
+
+        # Required stakeholders
+        stakeholders = result.get("required_stakeholders", [])
+        if stakeholders:
+            st.subheader(f"👥 Required stakeholders ({len(stakeholders)})")
+            for s in stakeholders:
+                with st.expander(f"**{s.get('team')}** — {s.get('role')}"):
+                    st.write(f"**Why:** {s.get('why')}")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            questions = result.get("open_questions", [])
+            if questions:
+                st.subheader(f"❓ Must answer before build ({len(questions)})")
+                for q in questions:
+                    st.warning(q)
+
+            risks = result.get("risk_areas", [])
+            if risks:
+                st.subheader("⚠️ Risk if wrong people excluded")
+                for r in risks:
+                    st.error(r)
+
+        with col2:
+            assumptions = result.get("assumptions_to_validate", [])
+            if assumptions:
+                st.subheader(f"💭 Assumptions to validate ({len(assumptions)})")
+                for a in assumptions:
+                    st.info(a)
+
+            checklist = result.get("checklist_items", [])
+            if checklist:
+                st.subheader(f"✅ Launch readiness checklist ({len(checklist)})")
+                for item in checklist:
+                    st.write(f"**{item.get('area')}:** {item.get('item')}")
+
+        if st.button("💾 Save kickoff to project state"):
+            c = conn.cursor()
+            c.execute("INSERT INTO kickoffs VALUES (NULL,?,?,?,?,?,?)", (
+                project_name, description,
+                json.dumps(scope), json.dumps(stakeholders),
+                json.dumps(result.get("checklist_items", [])),
+                datetime.now().isoformat()
+            ))
+            conn.commit()
+            st.success("Saved.")
+
+    # Show previous kickoffs
+    saved = conn.execute("SELECT * FROM kickoffs ORDER BY id DESC LIMIT 5").fetchall()
+    if saved:
+        st.divider()
+        st.markdown("**Previous kickoffs**")
+        for k in saved:
+            with st.expander(f"{k['project_name']} — {k['created_at'][:10]}"):
+                stakeholders = json.loads(k['stakeholders_json'])
+                st.write("**Required teams:** " + ", ".join([s['team'] for s in stakeholders]))
+
+
+# ── TAB 2: ANALYZE ────────────────────────────────────────────────────
+with tab2:
     st.subheader("Paste a conversation")
     st.caption("Can be a Teams thread, email, meeting notes — any text.")
 
@@ -455,8 +621,8 @@ Bob: Good. Carol, can you confirm the API docs are ready?"""
             st.success("Saved. View in Project State tab.")
             st.session_state["last_decisions"] = result.get("decisions", [])
 
-# ── TAB 2: PROJECT STATE ──────────────────────────────────────────────
-with tab2:
+# ── TAB 3: PROJECT STATE ──────────────────────────────────────────────
+with tab3:
     st.subheader("Current Project State")
 
     if st.button("🔄 Refresh"):
@@ -519,8 +685,8 @@ with tab2:
         st.success("Cleared.")
         st.rerun()
 
-# ── TAB 3: RESTATEMENT CHECK ──────────────────────────────────────────
-with tab3:
+# ── TAB 4: RESTATEMENT CHECK ──────────────────────────────────────────
+with tab4:
     st.subheader("Restatement Check")
     st.caption("After a decision is made, ask people what they think it means. Compare their answers to catch hidden misalignment.")
 
@@ -566,8 +732,8 @@ with tab3:
             else:
                 st.error(f"⚠️ Misalignment detected: {result.get('summary')}")
 
-# ── TAB 4: ESCALATION SIMULATOR ──────────────────────────────────────
-with tab4:
+# ── TAB 5: ESCALATION SIMULATOR ──────────────────────────────────────
+with tab5:
     st.subheader("Escalation Simulator")
     st.caption("Simulate time passing to see what alerts the agent would send.")
 
